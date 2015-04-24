@@ -2,43 +2,75 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 
 #include <gtk/gtk.h>
 #include <pango/pango.h>
 
+#define PROMPT '>'
 
+
+GtkTextBuffer *text_buffer;
 GString *typed_buffer;
+int user_key_event;
 
 typedef struct {
 	int pipe;
 	GtkTextBuffer *text_buffer;
 } TextBufferPipe;
 
-void *read_shell_output(void *param) {
-	TextBufferPipe *tbp = (TextBufferPipe *)param;
-	GtkTextBuffer *text_buffer = tbp->text_buffer;
-	int ui_in_pipe_end = tbp->pipe;
+typedef struct {
 	gchar byte;
+	GtkTextBuffer *text_buffer;
+} AtomicByteBuffer; 
 
-	while(1) {
-		if(read(ui_in_pipe_end, &byte, 1) == 1) {
-			gtk_text_buffer_insert_at_cursor(text_buffer, &byte, 1);
-			fprintf(stderr, "READING: %c\n", byte);
-		}
-	}
-	return param;
+
+
+gboolean insert_text_to_text_buffer(void *param) {
+	gchar *byte = (gchar *)param;
+	gtk_text_buffer_insert_at_cursor(text_buffer, byte, 1);
+	free(byte);
+	return FALSE;
 }
 
-void text_inserted(GtkTextBuffer *buffer, GtkTextIter *location, gchar *text, gint len, gpointer user_data) {
+void * read_shell_output(void *param) {
+	TextBufferPipe *tbp = (TextBufferPipe *)param;
+	int ui_in_pipe_end = tbp->pipe;
+	int characters_read = 0;
+
+	while(1) {
+		gchar *byte = malloc(1);
+		if(characters_read == 0) {
+			gchar *prompt = malloc(1);
+			*prompt = PROMPT;
+			gdk_threads_add_idle(insert_text_to_text_buffer, prompt);
+		}
+		// stuck here
+		characters_read = read(ui_in_pipe_end, byte, 1);
+		gdk_threads_add_idle(insert_text_to_text_buffer, byte);
+	}
+
+	return NULL;
+}
+
+void insert_text (GtkTextBuffer *textbuffer, GtkTextIter *location, gchar *text, gint len, gpointer user_data) {
+
+	if(!user_key_event) {
+		user_key_event = 0;
+		return;
+	}
+	user_key_event = 0;
+
 	TextBufferPipe *tbp = (TextBufferPipe *)user_data;
-	GtkTextBuffer *text_buffer = tbp->text_buffer;
 	int ui_out_pipe_end = tbp->pipe;
 
-	gchar *casefolded_str = g_utf8_casefold(text, len);
-	if(g_strcmp0(casefolded_str, "\n") != 0) {
-		typed_buffer = g_string_append(typed_buffer, text);
+	typed_buffer = g_string_append(typed_buffer, text);
+
+	if(g_strcmp0(text, "\n") != 0) {
 		return;	
 	}
+
+	clearerr(stdin);
 
 	// Send everything typed to stdin
 	gsize typed_buffer_len = typed_buffer->len;
@@ -49,7 +81,13 @@ void text_inserted(GtkTextBuffer *buffer, GtkTextIter *location, gchar *text, gi
 	g_free(typed_string);
 	typed_buffer = g_string_new(NULL);
 
-	fprintf(stderr, "WROTE TO OUTPUT\n");
+	return;
+}
+
+gboolean key_press_event(GtkWidget *text_view, GdkEvent *event, gpointer user_data) {
+	user_key_event = 1;
+
+	return FALSE;	
 }
 
 int main(int argc, char *argv[]) {
@@ -69,7 +107,7 @@ int main(int argc, char *argv[]) {
 	);
 
 	GtkWidget *text_view = gtk_text_view_new();
-	GtkTextBuffer *text_buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
+	text_buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
 
 	gtk_text_view_set_justification(GTK_TEXT_VIEW(text_view), GTK_JUSTIFY_FILL);
 
@@ -94,7 +132,11 @@ int main(int argc, char *argv[]) {
 		dup2(pipe1[0], STDIN_FILENO);
 		dup2(pipe2[1], STDOUT_FILENO);
 
-		execl("/bin/sh", "sh", "-i", NULL);
+		close(pipe1[0]);
+		close(pipe2[1]);
+
+		execl("/bin/sh", "sh", "-s", NULL);
+		fprintf(stderr, "FORK DYING\n");
 		_exit(EXIT_FAILURE);
 	}
 
@@ -106,24 +148,27 @@ int main(int argc, char *argv[]) {
 	close(pipe2[0]);
 	close(pipe2[1]);
 
-	/* GTK callback */
-	TextBufferPipe *tbp_in = malloc(sizeof(TextBufferPipe));
-	tbp_in->text_buffer = text_buffer;
-	tbp_in->pipe = pipe1[1];
-	g_signal_connect(text_buffer, "insert-text", G_CALLBACK(text_inserted), tbp_in);
+	user_key_event = 0;
 
-	/* Pthread thread */
+	/* (READ) Pthread thread */
 	TextBufferPipe *tbp_out = malloc(sizeof(TextBufferPipe));
 	tbp_out->text_buffer = text_buffer;
-	tbp_out->pipe = pipe2[0];
+	tbp_out->pipe = dup(STDIN_FILENO);
 	pthread_t read_shell_output_thread;
 	pthread_create(&read_shell_output_thread, NULL, read_shell_output, tbp_out);
+
+	/* (WRITE) GTK callback */
+	TextBufferPipe *tbp_in = malloc(sizeof(TextBufferPipe));
+	tbp_in->text_buffer = text_buffer;
+	tbp_in->pipe = dup(STDOUT_FILENO);
+	g_signal_connect(text_view, "key-press-event", G_CALLBACK(key_press_event), tbp_in);
+	g_signal_connect(text_buffer, "insert-text", G_CALLBACK(insert_text), tbp_in);
+
 
 	/* Start the chaos. */
 	gtk_main();
 
 	/* End the chaos. */
-	pthread_join(read_shell_output_thread, NULL);
 	free(tbp_out);
 	free(tbp_in);
 
